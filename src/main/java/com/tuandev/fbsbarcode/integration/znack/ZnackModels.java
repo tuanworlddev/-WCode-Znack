@@ -17,7 +17,7 @@ public final class ZnackModels {
     public enum OrderStatus {
         DRAFT, SUBMITTED, WAITING_CODES, CODES_READY, CODES_DOWNLOADED, PDF_GENERATED,
         INTRODUCTION_SKIPPED_MISSING_DOCUMENTS, INTRODUCTION_SKIPPED_MISSING_METADATA,
-        WAITING_INTRODUCTION_READINESS, INTRO_SENT, INTRODUCED, FAILED, CANCELLED
+        WAITING_INTRODUCTION_READINESS, INTRO_SENT, INTRODUCED, INTRODUCTION_FAILED, FAILED, CANCELLED
     }
 
     public enum KizInventoryStatus {
@@ -32,7 +32,7 @@ public final class ZnackModels {
         VALIDATING, CREATING_ORDER, POLLING_ORDER, DOWNLOADING_CODES,
         INTRODUCTION_SKIPPED_MISSING_DOCUMENTS, INTRODUCTION_SKIPPED_MISSING_METADATA,
         WAITING_INTRODUCTION_READINESS, SUBMITTING_INTRODUCTION, POLLING_INTRODUCTION,
-        INTRODUCED, COMPLETED, FAILED
+        INTRODUCTION_FAILED, INTRODUCED, COMPLETED, FAILED
     }
 
     public record ShopContext(int shopId, String shopName) {
@@ -165,11 +165,11 @@ public final class ZnackModels {
     public record Product(String gtin, String productName, String tnVed, String certificateType,
                           String certificateNumber, String certificateDate, String productionDate,
                           Boolean goodMarkFlag, Boolean goodTurnFlag, String cardStatus,
-                          String cardDetailedStatus, Instant readinessCheckedAt) {
+                          String cardDetailedStatus, String category, Instant readinessCheckedAt) {
         public Product(String gtin, String productName, String tnVed, String certificateType,
                        String certificateNumber, String certificateDate, String productionDate) {
             this(gtin, productName, tnVed, certificateType, certificateNumber, certificateDate, productionDate,
-                    null, null, "", "", null);
+                    null, null, "", "", "", null);
         }
 
         public boolean hasDocumentOverride() {

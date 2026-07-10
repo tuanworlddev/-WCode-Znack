@@ -52,6 +52,23 @@ class ZnackModuleTest {
         }
     }
 
+    @Test void errorDisplayExtractsHumanMessageFromApiJsonPayloads() {
+        assertEquals("HTTP 400: Ошибка аутентификации СУЗ: Сервис вернул пустой ответ",
+                ZnackErrorMessages.display(
+                        "Znack API request failed (HTTP 400): {\"error_message\":\"Ошибка аутентификации СУЗ: Сервис вернул пустой ответ\"}"));
+        assertEquals("HTTP 422: Подпись не соответствует данным документа",
+                ZnackErrorMessages.display(
+                        "Znack API request failed (HTTP 422): {\"fieldErrors\":[{\"fieldName\":\"signature\",\"errors\":[\"Подпись не соответствует данным документа\"]}]}"));
+        assertEquals("HTTP 400: GTIN không hợp lệ",
+                ZnackErrorMessages.display(
+                        "Znack API request failed (HTTP 400): {\"fieldErrors\":{\"gtin\":\"GTIN không hợp lệ\"}}"));
+        assertEquals("Znack API request failed (HTTP 500)",
+                ZnackErrorMessages.display("Znack API request failed (HTTP 500): {}"));
+        assertEquals("Missing TN VED.", ZnackErrorMessages.display("Missing TN VED."));
+        assertEquals("broken {not json", ZnackErrorMessages.display("broken {not json"));
+        assertEquals("", ZnackErrorMessages.display(null));
+    }
+
     @Test void sanitizerRedactsJsonAndHeaderStyleSecrets() {
         String sanitized=ZnackSanitizer.message("""
                 {"token":"secret-token","signature":"secret-signature","pin":"1234"}
@@ -434,9 +451,33 @@ class ZnackModuleTest {
 
         assertTrue(new ZnackIntroductionService(api,auth,testSigner(),repository).confirm(
                 testedSettings("","","","connection",""),repository.findOrder(orderId).orElseThrow(),
-                repository.findCodes(orderId)));
+                repository.findCodes(orderId)).introduced());
         assertEquals("010460123456789021abcdefghijklm",cisesRequest.get().getAsJsonArray().get(0).getAsString());
         assertEquals(OrderStatus.INTRODUCED,repository.findOrder(orderId).orElseThrow().localStatus());
+    }
+
+    @Test void introductionConfirmationPrefersDocumentSuccessOverNestedFailureStatuses() throws Exception {
+        ZnackRepository repository=repository(1,"Shop A");
+        long orderId=orderWithCodes(repository);
+        long documentId=repository.createDocument(orderId,"{}");
+        repository.updateDocument(documentId,"doc-id","SUBMITTED",null);
+        ZnackApiClient api=new ZnackApiClient(){
+            @Override public JsonElement document(String base,String token,String externalId){
+                return JsonParser.parseString(
+                        "{\"status\":\"CHECKED_OK\",\"items\":[{\"status\":\"REJECTED\"}]}");
+            }
+            @Override public JsonElement cisesInfo(String base,String token,JsonElement body){
+                return JsonParser.parseString("[{\"status\":\"INTRODUCED\"}]");
+            }
+        };
+        ZnackAuthService auth=new ZnackAuthService(api,testSigner()){
+            @Override public String trueApiToken(Settings s){return "token";}
+        };
+
+        assertTrue(new ZnackIntroductionService(api,auth,testSigner(),repository).confirm(
+                testedSettings("","","","connection",""),repository.findOrder(orderId).orElseThrow(),
+                repository.findCodes(orderId)).introduced());
+        assertEquals("CHECKED_OK",repository.findLatestDocument(orderId).orElseThrow().status());
     }
 
     @Test void introductionConfirmationDoesNotDoubleCountParentAndChildStatuses() throws Exception {
@@ -461,7 +502,7 @@ class ZnackModuleTest {
 
         assertFalse(new ZnackIntroductionService(api,auth,testSigner(),repository).confirm(
                 testedSettings("","","","connection",""),repository.findOrder(orderId).orElseThrow(),
-                repository.findCodes(orderId)));
+                repository.findCodes(orderId)).introduced());
         assertNotEquals(OrderStatus.INTRODUCED,repository.findOrder(orderId).orElseThrow().localStatus());
     }
 
@@ -484,6 +525,10 @@ class ZnackModuleTest {
             @Override public JsonElement productCards(String base,String token,String gtins){
                 return JsonParser.parseString("""
                         {"result":[{"good_name":"National Catalog Product",
+                        "categories":[
+                          {"cat_id":30717,"cat_name":"Обувь домашняя"},
+                          {"cat_id":30718,"cat_name":"Обувь детская"}
+                        ],
                         "good_attrs":[
                           {"attr_id":3959,"attr_name":"Группа ТНВЭД","attr_value":"6202"},
                           {"attr_id":13933,"attr_name":"Код ТНВЭД","attr_value":"6202 30 00 00"}
@@ -501,6 +546,7 @@ class ZnackModuleTest {
         Product synced=repository.findProducts().getFirst();
         assertEquals("National Catalog Product",synced.productName());
         assertEquals("6202300000",synced.tnVed());
+        assertEquals("Обувь домашняя, Обувь детская",synced.category());
         assertEquals("DOC-1",synced.certificateNumber());
         assertEquals("21.06.2024",synced.productionDate());
 
@@ -575,6 +621,61 @@ class ZnackModuleTest {
             assertTrue(rs.next());
             assertEquals(0,rs.getInt(1));
         }
+    }
+
+    @Test void deleteProductRemovesGtinWithMappingsOrdersCodesAndPipelines() {
+        ZnackRepository repository=repository(1,"Shop A");
+        com.tuandev.fbsbarcode.features.kizmapping.KizMappingRepository mappings=
+                new com.tuandev.fbsbarcode.features.kizmapping.KizMappingRepository();
+        String mappedOnly="04601234567890";
+        String purchased="04601234567891";
+        repository.upsertProducts(List.of(
+                new Product(mappedOnly,"Mapped",null,null,null,null,null),
+                new Product(purchased,"Purchased",null,null,null,null,null)));
+        mappings.replaceRulesForGtin(1,mappedOnly,
+                List.of(new com.tuandev.fbsbarcode.features.kizmapping.ZnackGtinMappingSelection("Shoes",null,true)));
+        long order=repository.createDraft(purchased,1);
+        repository.insertCodes(order,purchased,new DownloadedCodes(
+                List.of("010460123456789121abcdefghijklm91ABCD92sig"),"block"));
+        repository.createPipeline(purchased,1); // in-flight buy task must not block deletion
+
+        repository.deleteProduct(mappedOnly); // mapped, no purchase
+        repository.deleteProduct(purchased);  // mapped + order + codes + pipeline
+
+        assertTrue(repository.findProducts().isEmpty(),"both GTINs removed");
+        assertTrue(repository.findOrders().isEmpty(),"orders removed");
+        assertTrue(repository.findActivePipelines().isEmpty(),"pipelines removed");
+        assertTrue(repository.findCodes(order).isEmpty(),"downloaded codes removed");
+        assertTrue(mappings.findRulesForGtin(1,mappedOnly).isEmpty(),"mapping rules removed");
+    }
+
+    @Test void productSyncSkipsNonPublishedCardsAndDeletesUnreferencedExistingOnes() throws Exception {
+        ZnackRepository repository=repository(1,"Shop A");
+        String nowDraft="04601234567891";
+        repository.upsertProducts(List.of(new Product(nowDraft,"Was published before",null,null,null,null,null)));
+        ZnackApiClient api=new ZnackApiClient(){
+            @Override public JsonElement products(String base,String token){
+                return JsonParser.parseString("""
+                        {"results":[
+                          {"gtin":"04601234567890","productName":"Published","good_status":"published"},
+                          {"gtin":"04601234567891","productName":"Draft now","good_status":"draft"},
+                          {"gtin":"04601234567892","productName":"Errors","good_detailed_status":"errors"}
+                        ]}
+                        """);
+            }
+            @Override public JsonElement productCards(String base,String token,String gtins){
+                return JsonParser.parseString("{\"result\":[]}");
+            }
+        };
+        ZnackAuthService auth=new ZnackAuthService(api,testSigner()){
+            @Override public String trueApiToken(Settings s){return "token";}
+        };
+
+        List<Product> products=new ZnackProductService(api,auth,repository)
+                .sync(testedSettings("","","","connection",""));
+
+        assertEquals(List.of("04601234567890"),products.stream().map(Product::gtin).toList());
+        assertEquals(List.of("04601234567890"),repository.findProducts().stream().map(Product::gtin).toList());
     }
 
     @Test void blankHostsResolveToProductionWithoutReplacingCustomHosts() {

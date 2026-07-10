@@ -5,6 +5,7 @@ import com.tuandev.fbsbarcode.integration.znack.ZnackModels.*;
 import com.tuandev.fbsbarcode.integration.znack.ZnackPurchaseCoordinator;
 import com.tuandev.fbsbarcode.integration.znack.ZnackApiClient;
 import com.tuandev.fbsbarcode.integration.znack.ZnackAuthService;
+import com.tuandev.fbsbarcode.integration.znack.ZnackGtinAutoSync;
 import com.tuandev.fbsbarcode.integration.znack.ZnackProductService;
 import com.tuandev.fbsbarcode.integration.znack.ZnackRepository;
 import com.tuandev.fbsbarcode.integration.znack.ZnackSanitizer;
@@ -13,6 +14,7 @@ import com.tuandev.fbsbarcode.models.Shop;
 import com.tuandev.fbsbarcode.shared.AlertService;
 import com.tuandev.fbsbarcode.shared.AppTaskExecutor;
 import com.tuandev.fbsbarcode.shared.I18nService;
+import com.tuandev.fbsbarcode.ui.controls.CategoryFilterMenu;
 import javafx.concurrent.Task;
 import javafx.fxml.FXML;
 import javafx.scene.control.*;
@@ -22,6 +24,7 @@ import javafx.scene.input.KeyCode;
 import javafx.util.StringConverter;
 
 import java.nio.charset.StandardCharsets;
+import java.text.MessageFormat;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
@@ -29,6 +32,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 public class ZnackAutomationController {
     private static final DateTimeFormatter CERTIFICATE_DATE = DateTimeFormatter.ofPattern("dd.MM.yyyy");
@@ -36,23 +40,39 @@ public class ZnackAutomationController {
     @FXML private Label settingsTitleLabel, omsIdLabel, omsConnectionLabel;
     @FXML private Label omsHelpTitleLabel, omsHelpDescriptionLabel, omsHelpStepsTitleLabel, omsHelpStepsLabel;
     @FXML private Label omsHelpRecognizeTitleLabel, omsHelpRecognizeLabel, omsHelpWarningLabel;
-    @FXML private Label signatureTitleLabel, signatureHelpLabel, defaultGoodsDocumentLabel, defaultGoodsDocumentHelpLabel;
+    @FXML private Label signatureTitleLabel, defaultGoodsDocumentLabel;
     @FXML private Label documentNumberLabel, documentIssueDateLabel;
-    @FXML private Tab settingsTab, productsTab, ordersTab, logsTab;
+    @FXML private Tab settingsTab, productsTab, deletedTab, ordersTab, logsTab;
     @FXML private TextField omsIdField, omsConnectionField, documentNumberField, documentIssueDateField;
+    @FXML private TextField productSearchField, deletedSearchField;
     @FXML private ComboBox<CryptoProCertificateInfo> signatureCertificateCombo;
     @FXML private CheckBox autoIntroductionCheck;
-    @FXML private Button saveButton, testSignatureButton;
+    @FXML private Button saveButton, testSignatureButton, deleteSelectedButton;
+    @FXML private MenuButton productCategoryFilterButton, deletedCategoryFilterButton;
     @FXML private Button omsIdHelpButton, omsConnectionHelpButton, closeOmsHelpButton;
     @FXML private javafx.scene.layout.VBox omsHelpPane;
     @FXML private TableView<Product> productsTable;
-    @FXML private TableColumn<Product,String> productGtinColumn, productNameColumn, productTnVedColumn;
+    @FXML private TableColumn<Product,String> productGtinColumn, productNameColumn, productCategoryColumn, productTnVedColumn;
+    @FXML private TableColumn<Product,Product> productSelectColumn, productActionsColumn;
+    @FXML private TableView<Product> deletedTable;
+    @FXML private TableColumn<Product,String> deletedGtinColumn, deletedNameColumn;
+    @FXML private TableColumn<Product,Product> deletedActionsColumn;
     @FXML private TableView<KizOrder> ordersTable;
     @FXML private TableColumn<KizOrder,Number> orderIdColumn;
     @FXML private TableColumn<KizOrder,String> orderGtinColumn, orderStatusColumn;
     @FXML private TableView<OperationLog> logsTable;
     @FXML private TableColumn<OperationLog,String> logTimeColumn, logActionColumn, logEntityColumn, logSeverityColumn, logResultColumn;
 
+    private static final java.util.Comparator<Product> BY_CATEGORY_THEN_GTIN = java.util.Comparator
+            .comparing((Product p) -> p.category() == null || p.category().isBlank() ? 1 : 0)
+            .thenComparing(p -> value(p.category()), String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(Product::gtin);
+    private final CheckBox selectAllProducts = new CheckBox();
+    private final java.util.Set<String> selectedProductGtins = new java.util.HashSet<>();
+    private CategoryFilterMenu productCategoryFilter;
+    private CategoryFilterMenu deletedCategoryFilter;
+    private List<Product> allProducts = List.of();
+    private List<Product> allDeletedProducts = List.of();
     private ZnackRepository repository;
     private Settings loaded = Settings.empty();
     private String signerCertificate = "";
@@ -73,7 +93,33 @@ public class ZnackAutomationController {
     private void initialize() {
         productGtinColumn.setCellValueFactory(v -> text(v.getValue().gtin()));
         productNameColumn.setCellValueFactory(v -> text(v.getValue().productName()));
+        productCategoryColumn.setCellValueFactory(v -> text(v.getValue().category()));
         productTnVedColumn.setCellValueFactory(v -> text(v.getValue().tnVed()));
+        productActionsColumn.setCellValueFactory(v -> new javafx.beans.property.SimpleObjectProperty<>(v.getValue()));
+        productActionsColumn.setCellFactory(column -> new ProductActionsCell());
+        productSelectColumn.setCellValueFactory(v -> new javafx.beans.property.SimpleObjectProperty<>(v.getValue()));
+        productSelectColumn.setCellFactory(column -> new ProductSelectCell());
+        productSelectColumn.setGraphic(selectAllProducts);
+        selectAllProducts.setOnAction(event -> {
+            if (selectAllProducts.isSelected()) {
+                productsTable.getItems().forEach(product -> selectedProductGtins.add(product.gtin()));
+            } else {
+                selectedProductGtins.clear();
+            }
+            productsTable.refresh();
+            updateProductSelectionState();
+        });
+        productSearchField.textProperty().addListener((ignored, old, value) -> applyProductFilter());
+        deletedSearchField.textProperty().addListener((ignored, old, value) -> applyDeletedFilter());
+        productCategoryFilter = new CategoryFilterMenu(productCategoryFilterButton, this::applyProductFilter);
+        deletedCategoryFilter = new CategoryFilterMenu(deletedCategoryFilterButton, this::applyDeletedFilter);
+        deletedGtinColumn.setCellValueFactory(v -> text(v.getValue().gtin()));
+        deletedNameColumn.setCellValueFactory(v -> text(v.getValue().productName()));
+        deletedActionsColumn.setCellValueFactory(v -> new javafx.beans.property.SimpleObjectProperty<>(v.getValue()));
+        deletedActionsColumn.setCellFactory(column -> new DeletedProductActionsCell());
+        deletedTab.selectedProperty().addListener((ignored, old, selected) -> {
+            if (selected) loadDeletedProducts();
+        });
         orderIdColumn.setCellValueFactory(v -> new javafx.beans.property.SimpleLongProperty(v.getValue().id()));
         orderGtinColumn.setCellValueFactory(v -> text(v.getValue().gtin()));
         orderStatusColumn.setCellValueFactory(v -> text(localizeStatus(v.getValue().localStatus().name())));
@@ -96,7 +142,7 @@ public class ZnackAutomationController {
         productsTab.selectedProperty().addListener((ignored, old, selected) -> {
             if (selected) {
                 loadProductsFromDatabase();
-                requestProductSync();
+                requestProductSyncOnOpen();
             }
         });
         for (TextField field : List.of(omsIdField, omsConnectionField, documentNumberField, documentIssueDateField)) {
@@ -131,7 +177,8 @@ public class ZnackAutomationController {
         repository = shop == null ? null : new ZnackRepository(new ShopContext(shop.getId(), shop.getName()));
         if (repository == null) clear(); else {
             load();
-            if (productsTab.isSelected()) requestProductSync();
+            loadDeletedProducts();
+            if (productsTab.isSelected()) requestProductSyncOnOpen();
         }
     }
 
@@ -146,30 +193,42 @@ public class ZnackAutomationController {
         titleLabel.setText(tr("znack.title"));
         settingsTab.setText(tr("znack.tab.settings"));
         productsTab.setText(tr("znack.tab.products"));
+        deletedTab.setText(tr("znack.tab.deleted"));
         ordersTab.setText(tr("znack.tab.orders"));
         logsTab.setText(tr("znack.tab.logs"));
+        productSearchField.setPromptText(tr("kiz_mapping.search_gtin"));
+        deletedSearchField.setPromptText(tr("kiz_mapping.search_gtin"));
+        productCategoryFilter.setTexts(tr("znack.filter.button"), tr("znack.filter.no_category"), tr("znack.filter.clear"));
+        deletedCategoryFilter.setTexts(tr("znack.filter.button"), tr("znack.filter.no_category"), tr("znack.filter.clear"));
+        deleteSelectedButton.setTooltip(new Tooltip(tr("znack.products.delete_selected")));
+        deleteSelectedButton.setAccessibleText(tr("znack.products.delete_selected"));
+        deletedGtinColumn.setText(tr("znack.field.gtin"));
+        deletedNameColumn.setText(tr("znack.field.name"));
+        deletedActionsColumn.setText(tr("znack.field.actions"));
         settingsTitleLabel.setText(tr("znack.settings.basic"));
         omsIdLabel.setText(tr("znack.oms_id"));
         omsConnectionLabel.setText(tr("znack.oms_connection"));
-        omsIdHelpButton.setText(tr("common.help"));
-        omsConnectionHelpButton.setText(tr("common.help"));
+        omsIdHelpButton.setTooltip(new Tooltip(tr("common.help")));
+        omsConnectionHelpButton.setTooltip(new Tooltip(tr("common.help")));
         omsIdHelpButton.setAccessibleText(tr("znack.help.oms_id.button"));
         omsConnectionHelpButton.setAccessibleText(tr("znack.help.oms_connection.button"));
         closeOmsHelpButton.setText(tr("common.close"));
         omsHelpStepsTitleLabel.setText(tr("znack.help.steps_title"));
         omsHelpRecognizeTitleLabel.setText(tr("znack.help.recognize_title"));
         signatureTitleLabel.setText(tr("znack.digital_signature"));
-        signatureHelpLabel.setText(tr("znack.signature.help"));
         testSignatureButton.setText(tr("znack.signature.test"));
+        testSignatureButton.setTooltip(new Tooltip(tr("znack.signature.help")));
         defaultGoodsDocumentLabel.setText(tr("znack.default_goods_document"));
-        defaultGoodsDocumentHelpLabel.setText(tr("znack.default_goods_document_help"));
+        autoIntroductionCheck.setTooltip(new Tooltip(tr("znack.default_goods_document_help")));
         documentNumberLabel.setText(tr("znack.document_number"));
         documentIssueDateLabel.setText(tr("znack.document_issue_date"));
         autoIntroductionCheck.setText(tr("znack.auto_introduction"));
         saveButton.setText(tr("znack.save"));
         productGtinColumn.setText(tr("znack.field.gtin"));
         productNameColumn.setText(tr("znack.field.name"));
+        productCategoryColumn.setText(tr("znack.field.category"));
         productTnVedColumn.setText(tr("znack.field.tn_ved"));
+        productActionsColumn.setText(tr("znack.field.actions"));
         orderIdColumn.setText(tr("znack.field.id"));
         orderGtinColumn.setText(tr("znack.field.gtin"));
         orderStatusColumn.setText(tr("znack.field.status"));
@@ -369,14 +428,237 @@ public class ZnackAutomationController {
         testedConfigurationKey = signerTestedAt == null ? null : configurationKey();
         loading = false;
         savedFingerprint = fingerprint();
-        authStatusLabel.setText(tr("znack.status.audit_only"));
+        authStatusLabel.setText("");
         updateSignatureSummary();
         updateSaveState();
     }
 
     private void loadProductsFromDatabase() {
-        if (repository == null) productsTable.getItems().clear();
-        else productsTable.getItems().setAll(repository.findProducts());
+        allProducts = repository == null ? List.of() : repository.findProducts();
+        selectedProductGtins.retainAll(allProducts.stream().map(Product::gtin)
+                .collect(java.util.stream.Collectors.toSet()));
+        productCategoryFilter.rebuild(allProducts.stream().map(Product::category).toList());
+        applyProductFilter();
+    }
+
+    private void applyProductFilter() {
+        String query = productSearchField.getText() == null
+                ? "" : productSearchField.getText().trim().toLowerCase(java.util.Locale.ROOT);
+        productsTable.getItems().setAll(allProducts.stream()
+                .filter(product -> productCategoryFilter.matches(product.category()))
+                .filter(product -> query.isEmpty()
+                        || containsIgnoreCase(product.gtin(), query)
+                        || containsIgnoreCase(product.productName(), query)
+                        || containsIgnoreCase(product.category(), query))
+                .sorted(BY_CATEGORY_THEN_GTIN)
+                .toList());
+        updateProductSelectionState();
+    }
+
+    private static boolean containsIgnoreCase(String value, String query) {
+        return value != null && value.toLowerCase(java.util.Locale.ROOT).contains(query);
+    }
+
+    private void updateProductSelectionState() {
+        deleteSelectedButton.setDisable(repository == null || selectedProductGtins.isEmpty());
+        selectAllProducts.setSelected(!productsTable.getItems().isEmpty()
+                && productsTable.getItems().stream().allMatch(p -> selectedProductGtins.contains(p.gtin())));
+    }
+
+    @FXML
+    private void deleteSelectedProducts() {
+        deleteProducts(List.copyOf(selectedProductGtins));
+    }
+
+    private void deleteProduct(Product product) {
+        if (product != null) deleteProducts(List.of(product.gtin()));
+    }
+
+    private void deleteProducts(List<String> gtins) {
+        if (repository == null || gtins.isEmpty()) return;
+        long generation = shopGeneration;
+        ZnackRepository currentRepository = repository;
+        Task<Void> task = new Task<>() {
+            @Override protected Void call() {
+                currentRepository.softDeleteProducts(gtins);
+                for (String gtin : gtins) currentRepository.log("GTIN_DELETE", gtin, "INFO", "HIDDEN", null);
+                return null;
+            }
+        };
+        task.setOnSucceeded(event -> {
+            if (generation != shopGeneration || currentRepository != repository) return;
+            gtins.forEach(selectedProductGtins::remove);
+            loadProductsFromDatabase();
+            loadDeletedProducts();
+            logsTable.getItems().setAll(currentRepository.findLogs());
+        });
+        task.setOnFailed(event -> {
+            if (generation != shopGeneration || currentRepository != repository) return;
+            Throwable failure = task.getException();
+            AlertService.showError(value(failure == null ? null : failure.getMessage()));
+        });
+        AppTaskExecutor.execute(task);
+    }
+
+    private void loadDeletedProducts() {
+        if (repository == null) {
+            allDeletedProducts = List.of();
+            deletedTable.getItems().clear();
+            return;
+        }
+        long generation = shopGeneration;
+        ZnackRepository currentRepository = repository;
+        Task<List<Product>> task = new Task<>() {
+            @Override protected List<Product> call() {
+                return currentRepository.findDeletedProducts();
+            }
+        };
+        task.setOnSucceeded(event -> {
+            if (generation != shopGeneration || currentRepository != repository) return;
+            allDeletedProducts = task.getValue();
+            deletedCategoryFilter.rebuild(allDeletedProducts.stream().map(Product::category).toList());
+            applyDeletedFilter();
+        });
+        AppTaskExecutor.execute(task);
+    }
+
+    private void applyDeletedFilter() {
+        String query = deletedSearchField.getText() == null
+                ? "" : deletedSearchField.getText().trim().toLowerCase(java.util.Locale.ROOT);
+        deletedTable.getItems().setAll(allDeletedProducts.stream()
+                .filter(product -> deletedCategoryFilter.matches(product.category()))
+                .filter(product -> query.isEmpty()
+                        || containsIgnoreCase(product.gtin(), query)
+                        || containsIgnoreCase(product.productName(), query)
+                        || containsIgnoreCase(product.category(), query))
+                .sorted(BY_CATEGORY_THEN_GTIN)
+                .toList());
+    }
+
+    private void restoreProduct(Product product) {
+        if (repository == null || product == null) return;
+        long generation = shopGeneration;
+        ZnackRepository currentRepository = repository;
+        String gtin = product.gtin();
+        Task<Void> task = new Task<>() {
+            @Override protected Void call() {
+                currentRepository.restoreProducts(List.of(gtin));
+                currentRepository.log("GTIN_RESTORE", gtin, "INFO", "RESTORED", null);
+                return null;
+            }
+        };
+        task.setOnSucceeded(event -> {
+            if (generation != shopGeneration || currentRepository != repository) return;
+            loadProductsFromDatabase();
+            loadDeletedProducts();
+            logsTable.getItems().setAll(currentRepository.findLogs());
+        });
+        task.setOnFailed(event -> {
+            if (generation != shopGeneration || currentRepository != repository) return;
+            Throwable failure = task.getException();
+            AlertService.showError(value(failure == null ? null : failure.getMessage()));
+        });
+        AppTaskExecutor.execute(task);
+    }
+
+    private void purgeProduct(Product product) {
+        if (repository == null || product == null) return;
+        Optional<ButtonType> result = AlertService.showConfirmation(
+                tr("znack.product.delete.title"),
+                MessageFormat.format(tr("znack.product.delete.header"), value(product.gtin())),
+                tr("znack.product.delete.content"));
+        if (result.isEmpty() || result.get() != ButtonType.OK) return;
+        long generation = shopGeneration;
+        ZnackRepository currentRepository = repository;
+        String gtin = product.gtin();
+        Task<Void> task = new Task<>() {
+            @Override protected Void call() {
+                currentRepository.deleteProduct(gtin);
+                currentRepository.log("GTIN_DELETE", gtin, "INFO", "DELETED", null);
+                return null;
+            }
+        };
+        task.setOnSucceeded(event -> {
+            if (generation != shopGeneration || currentRepository != repository) return;
+            loadDeletedProducts();
+            ordersTable.getItems().setAll(currentRepository.findOrders());
+            logsTable.getItems().setAll(currentRepository.findLogs());
+        });
+        task.setOnFailed(event -> {
+            if (generation != shopGeneration || currentRepository != repository) return;
+            Throwable failure = task.getException();
+            AlertService.showError(value(failure == null ? null : failure.getMessage()));
+        });
+        AppTaskExecutor.execute(task);
+    }
+
+    private Button iconButton(String icon, String tooltip) {
+        Button button = new Button();
+        button.getStyleClass().add("btn-icon");
+        button.setGraphic(new org.kordamp.ikonli.javafx.FontIcon(icon));
+        button.setTooltip(new Tooltip(tooltip));
+        button.setAccessibleText(tooltip);
+        return button;
+    }
+
+    private final class ProductSelectCell extends TableCell<Product, Product> {
+        private final CheckBox check = new CheckBox();
+
+        private ProductSelectCell() {
+            check.setOnAction(event -> {
+                Product item = getItem();
+                if (item == null) return;
+                if (check.isSelected()) selectedProductGtins.add(item.gtin());
+                else selectedProductGtins.remove(item.gtin());
+                updateProductSelectionState();
+            });
+        }
+
+        @Override protected void updateItem(Product item, boolean empty) {
+            super.updateItem(item, empty);
+            if (empty || item == null) {
+                setGraphic(null);
+                return;
+            }
+            check.setSelected(selectedProductGtins.contains(item.gtin()));
+            setGraphic(check);
+        }
+    }
+
+    private final class ProductActionsCell extends TableCell<Product, Product> {
+        private final Button delete = iconButton("fth-trash-2", tr("common.delete"));
+
+        private ProductActionsCell() {
+            delete.setOnAction(event -> deleteProduct(getItem()));
+        }
+
+        @Override protected void updateItem(Product item, boolean empty) {
+            super.updateItem(item, empty);
+            setGraphic(empty || item == null ? null : delete);
+        }
+    }
+
+    private final class DeletedProductActionsCell extends TableCell<Product, Product> {
+        private final Button restore = iconButton("fth-rotate-ccw", tr("znack.products.restore"));
+        private final Button purge = iconButton("fth-trash-2", tr("znack.products.delete_forever"));
+        private final javafx.scene.layout.HBox box = new javafx.scene.layout.HBox(6, restore, purge);
+
+        private DeletedProductActionsCell() {
+            restore.setOnAction(event -> restoreProduct(getItem()));
+            purge.setOnAction(event -> purgeProduct(getItem()));
+        }
+
+        @Override protected void updateItem(Product item, boolean empty) {
+            super.updateItem(item, empty);
+            setGraphic(empty || item == null ? null : box);
+        }
+    }
+
+    private void requestProductSyncOnOpen() {
+        if (repository == null || productSyncRunning || !hasVerifiedSignature(loaded)) return;
+        // Auto-sync from Znack only the first time a shop's GTIN data is loaded in this session
+        // (shared with the other KIZ panes); saving settings still triggers a fresh sync.
+        if (ZnackGtinAutoSync.shouldAutoSync(repository.shop().shopId())) requestProductSync();
     }
 
     private void requestProductSync() {
@@ -401,7 +683,9 @@ public class ZnackAutomationController {
         task.setOnSucceeded(event -> {
             if (generation != shopGeneration || currentRepository != repository) return;
             productSyncRunning = false;
-            productsTable.getItems().setAll(task.getValue());
+            allProducts = task.getValue();
+            productCategoryFilter.rebuild(allProducts.stream().map(Product::category).toList());
+            applyProductFilter();
             ordersTable.getItems().setAll(currentRepository.findOrders());
             logsTable.getItems().setAll(currentRepository.findLogs());
             resumeEligibleIntroductions(currentSettings);
@@ -409,7 +693,7 @@ public class ZnackAutomationController {
         task.setOnFailed(event -> {
             if (generation != shopGeneration || currentRepository != repository) return;
             productSyncRunning = false;
-            productsTable.getItems().setAll(currentRepository.findProducts());
+            loadProductsFromDatabase();
             logsTable.getItems().setAll(currentRepository.findLogs());
         });
         AppTaskExecutor.execute(task);
@@ -434,9 +718,18 @@ public class ZnackAutomationController {
         loaded = Settings.empty();
         for (TextField field : List.of(omsIdField, omsConnectionField, documentNumberField, documentIssueDateField)) field.clear();
         signatureCertificateCombo.getItems().clear();
+        allProducts = List.of();
+        allDeletedProducts = List.of();
+        selectedProductGtins.clear();
+        productSearchField.clear();
+        deletedSearchField.clear();
+        productCategoryFilter.rebuild(List.of());
+        deletedCategoryFilter.rebuild(List.of());
         productsTable.getItems().clear();
+        deletedTable.getItems().clear();
         ordersTable.getItems().clear();
         logsTable.getItems().clear();
+        updateProductSelectionState();
         autoIntroductionCheck.setSelected(false);
         signerCertificate = "";
         certificateMetadata = "";
